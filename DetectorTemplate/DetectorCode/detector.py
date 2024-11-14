@@ -11,7 +11,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 class Detector(ADetector):
     def detect_bot(self, session_data):
         accounts = []
-        stop_words = {"the", "and", "is", "in", "to", "of", "a", "for", "on", "at", "by", "with", "an", "this", "that", "it"}
+        # Define stop words as a list instead of a set
+        stop_words = ["the", "it", "by", "of", "that", "is", "with", "this", "for", "a", "to", "at", "and", "in", "on", "an"]
+
+        # Initialize the vectorizer with stop words as a list
+        vectorizer = TfidfVectorizer(stop_words=stop_words)
+
         emoji_pattern = re.compile("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]+", flags=re.UNICODE)
         invalid_location_patterns = ["she/her", "he/him", "they/them", "planet", "moon", "universe"]
 
