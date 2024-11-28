@@ -1,225 +1,273 @@
+# Import necessary libraries
 from abc_classes import ADetector
 from teams_classes import DetectionMark
-from textblob import TextBlob
-import numpy as np
+from collections import Counter
 import re
 from datetime import datetime
-import concurrent.futures
 import openai
+import os
+from difflib import SequenceMatcher
 import json
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import IsolationForest
-import random
 
+# Set your OpenAI API key
+openai.api_key = 'sk-svcacct-hLryFGI6k7id2c8JNbQfOIBQku4N4FaI4ZNudgEHicS4kO5HhTcm5HKt3cPxi4RWKggfT3BlbkFJse802MFwaCvHoH_nSgEZPX-f2sQIfNh6e71_LtPsxnN5uE8milyoxoJBpVBrpioInWwA'  # Replace with your actual API key
+
+# Define the Detector class
 class Detector(ADetector):
-    def __init__(self):
-        self.api_key = "sk-svcacct-hLryFGI6k7id2c8JNbQfOIBQku4N4FaI4ZNudgEHicS4kO5HhTcm5HKt3cPxi4RWKggfT3BlbkFJse802MFwaCvHoH_nSgEZPX-f2sQIfNh6e71_LtPsxnN5uE8milyoxoJBpVBrpioInWwA"
-        openai.api_key = self.api_key
-
     def detect_bot(self, session_data):
         accounts = []
-        emoji_pattern = re.compile("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]+", flags=re.UNICODE)
-        invalid_location_patterns = ["she/her", "he/him", "they/them", "planet", "moon", "universe"]
+        user_ids_processed = set()  # Keep track of processed user IDs (as strings)
 
-        stop_words = ["the", "it", "by", "of", "that", "is", "with", "this", "for", "a", "to", "at", "and", "in", "on", "an"]
-        vectorizer = TfidfVectorizer(max_features=1000, stop_words=stop_words)
-        clf = IsolationForest(contamination=0.1)
+        # Build a mapping from user IDs to user data
+        user_id_to_user = {str(user['id']): user for user in session_data.users}
 
-        all_posts = [post['text'] for post in session_data.posts]
-        tfidf_matrix = vectorizer.fit_transform(all_posts)
-        
-        user_features = np.array([
-            [
-                user.get('tweet_count', 0),
-                user.get('z_score', 0)
-            ] for user in session_data.users
-        ])
+        # Collect posts for each user
+        user_posts = {}
+        for post in session_data.posts:
+            user_id_str = str(post['author_id'])
+            if user_id_str not in user_posts:
+                user_posts[user_id_str] = []
+            user_posts[user_id_str].append(post['text'])
 
-        # Fit the IsolationForest on the collected features
-        clf.fit(user_features)
+        # Define the emoji pattern
+        emoji_pattern = re.compile(
+            "[\U0001F600-\U0001F64F"  # Emoticons
+            "\U0001F300-\U0001F5FF"  # Symbols & Pictographs
+            "\U0001F680-\U0001F6FF"  # Transport & Map Symbols
+            "\U0001F1E0-\U0001F1FF"  # Flags
+            "\U00002702-\U000027B0"
+            "\U000024C2-\U0001F251"
+            "]+", flags=re.UNICODE
+        )
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(self.process_user, user, session_data, vectorizer, clf, emoji_pattern, invalid_location_patterns)
-                for user in session_data.users
+        # First pass: Heuristic analysis
+        for user in session_data.users:
+            user_id_str = str(user['id'])
+            if user_id_str in user_ids_processed:
+                continue  # Skip if already processed
+
+            is_bot = False
+            confidence = 50  # Start with a neutral confidence
+
+            # # Rule 1: Check if the username or description contains "bot"
+            # if "bot" in user.get('username', '').lower() or "bot" in user.get('description', '').lower():
+            #     confidence += 20  # Increase confidence moderately
+
+            # Rule 2: Check if the user has repetitive tweets with similar content
+            posts = user_posts.get(user_id_str, [])
+            if len(posts) > 1:  # Ensure there are at least two posts to compare
+                similarity_threshold = 0.8  # Threshold for similarity (can be adjusted)
+                similar_pairs_count = 0
+                total_pairs = 0
+
+                # Compare each tweet with every other tweet
+                for i in range(len(posts)):
+                    for j in range(i + 1, len(posts)):
+                        total_pairs += 1
+                        similarity_ratio = SequenceMatcher(None, posts[i], posts[j]).ratio()
+                        if similarity_ratio > similarity_threshold:
+                            similar_pairs_count += 1
+
+                # If the majority of the tweets are similar, classify as a bot
+                if total_pairs > 0 and (similar_pairs_count / total_pairs) > 0.5:  # More than 50% of pairs are similar
+                    is_bot = True
+                    confidence = max(confidence, 100)
+
+            # Rule 3: Check if the location is suspicious or empty
+            location = user.get('location', '')
+            if location:
+                location = location.lower()
+                invalid_location_patterns = [
+                    "she/her", "he/him", "they/them", "pronouns", "blk", "rainbow",
+                    "planet", "mars", "moon", "space", "anywhere", "nowhere",
+                    "everywhere", "earth", "universe"
+                ]
+                for pattern in invalid_location_patterns:
+                    if pattern in location:
+                        confidence += 10  # Slight bot indicator
+                        break
+                if emoji_pattern.search(location):
+                    confidence += 10  # Slight bot indicator
+            else:
+                # Empty location might be slightly suspicious
+                confidence += 5
+
+            # Rule 4: Analyze tweet count
+            tweet_count = user.get('tweet_count', 0)
+            if 100 <= tweet_count <= 1000:
+                confidence += 5  # Slight bot indicator
+
+            # Rule 5: Analyze z_score for abnormal values
+            z_score = user.get('z_score', 0)
+            if z_score < -2 or z_score > 2:
+                confidence += 10  # Moderate bot indicator
+
+            # Rule 6: Check language usage of posts
+            user_languages = set(post['lang'] for post in session_data.posts if str(post['author_id']) == user_id_str)
+            if len(user_languages) > 2:
+                confidence += 10  # Moderate bot indicator
+            for lang in user_languages:
+                if emoji_pattern.search(lang):
+                    confidence += 10  # Moderate bot indicator
+
+            # Rule 7: Posting times (e.g., very frequent, non-human intervals)
+            posting_times = [
+                post['created_at'] for post in session_data.posts if str(post['author_id']) == user_id_str
             ]
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result:
-                    accounts.append(result)
-                    username = next((u["username"] for u in session_data.users if u["id"] == result.user_id), "Unknown")
-                    #print(f"Username: {username}, Is Bot: {result.bot}, Confidence: {result.confidence}")
+            if len(posting_times) > 1:
+                # Check the time difference between consecutive posts
+                time_differences = [
+                    (
+                        datetime.strptime(posting_times[i], "%Y-%m-%dT%H:%M:%S.000Z") -
+                        datetime.strptime(posting_times[i - 1], "%Y-%m-%dT%H:%M:%S.000Z")
+                    ).total_seconds()
+                    for i in range(1, len(posting_times))
+                ]
+                # If posts are too close together, flag as suspicious
+                if any(diff < 10 for diff in time_differences):  # Less than 10 seconds between posts
+                    confidence += 10  # Moderate bot indicator
 
-        # print(f"Total users: {len(session_data.users)}")
-        # print(f"Total tweets: {len(session_data.posts)}")
+            # Ensure confidence is within 0-100%
+            confidence = max(0, min(confidence, 100))
+
+            # Determine if the user is a bot based on confidence
+            is_bot = confidence >= 70  # You can adjust this threshold as needed
+
+            # Final classification for high confidence users
+            detection = DetectionMark(
+                user_id=user_id_str,  # User ID as string
+                confidence=confidence,
+                bot=is_bot
+            )
+            accounts.append(detection)
+            user_ids_processed.add(user_id_str)
+
+        # Print the results for the first few users only
+        for detection in accounts[:5]:
+            user = user_id_to_user.get(detection.user_id, {})
+            print(f"User ID: {detection.user_id}")
+            print(f"Username: {user.get('username', 'N/A')}")
+            print(f"Confidence: {detection.confidence}%")
+            print(f"Classified as bot: {detection.bot}")
+            print("-" * 30)
 
         return accounts
 
-    def process_user(self, user, session_data, vectorizer, clf, emoji_pattern, invalid_location_patterns):
-        try:
-            
-           # Initialize heuristic score
-            score = 50  # Default starting score
-            
-            # Collect user's posts
-            user_posts = [post['text'] for post in session_data.posts if post['author_id'] == user['id']]
-            
-            if user_posts:
-                # Average word count
-                avg_word_count = sum(len(post.split()) for post in user_posts) / len(user_posts)
-                
-                # Vocabulary Diversity
-                unique_words = set(word for post in user_posts for word in post.split())
-                total_words = sum(len(post.split()) for post in user_posts)
-                vocab_diversity = len(unique_words) / total_words if total_words > 0 else 0
-                if vocab_diversity < 0.1:
-                    score += 20
-                elif vocab_diversity < 0.3:
-                    score += 10
-                else:
-                    score -= 10
-                
-                # Sentiment Consistency
-                sentiments = [TextBlob(post).sentiment.polarity for post in user_posts]
-                sentiment_variance = np.var(sentiments)
-                if sentiment_variance < 0.05:
-                    score += 15
-                elif sentiment_variance > 0.2:
-                    score -= 10
-                
-                # Keyword Density using TF-IDF
-                user_tfidf_vector = vectorizer.transform(user_posts)
-                avg_tfidf_score = user_tfidf_vector.mean()
-                score += 20 if avg_tfidf_score > 0.5 else -10
-                
-                # Emoji Analysis
-                emoji_count = sum(len(emoji_pattern.findall(post)) for post in user_posts)
-                avg_emoji_usage = emoji_count / len(user_posts)
-                score += 10 if avg_emoji_usage > 3 else (-5 if avg_emoji_usage < 1 else 0)
-                
-                # Temporal Posting Pattern Analysis
-                posting_times = [
-                    datetime.strptime(post['created_at'], "%Y-%m-%dT%H:%M:%S.000Z")
-                    for post in session_data.posts if post['author_id'] == user['id']
-                ]
-                if len(posting_times) > 1:
-                    intervals = np.diff(sorted(posting_times)).astype('timedelta64[s]').astype(int)
-                    avg_interval = np.mean(intervals) if intervals.size > 0 else 0
-                    if avg_interval < 300:
-                        score += 20
-                    elif avg_interval > 300:
-                        score -= 15
-                else:
-                    avg_interval = 0
-            else:
-                # User has no posts
-                avg_word_count = 0
-                vocab_diversity = 0
-                sentiment_variance = 0
-                avg_tfidf_score = 0
-                avg_emoji_usage = 0
-                avg_interval = 0
-                score -= 10  # Penalize for no posts
-            
-            # Location Validity Check
-            location = (user.get('location') or '').lower()
-            if any(loc in location for loc in invalid_location_patterns):
-                score += 10
-            else:
-                score -= 10
+    # Function to analyze a batch of users with ChatGPT
+    def analyze_users_with_chatgpt(self, users, user_posts):
+        # Prepare the prompt
+        prompt = """
+You are an expert in detecting social media bots and fake bots.
 
-            
-            # Anomaly Detection with Isolation Forest
-            data_point = np.array([[
-                user.get('tweet_count', 0),
-                user.get('z_score', 0)
-            ]])
-            outlier = clf.predict(data_point)
-            score += 30 if outlier[0] == -1 else -10
-            
-            # Normalize heuristic confidence
-            score = max(20, score)  # Set minimum score to 20
-            heuristic_bot_confidence = max(0, min(score, 100))
-            heuristic_not_bot_confidence = 100 - heuristic_bot_confidence
+Analyze the following user profiles and their recent posts to determine the likelihood that each user is a bot.
 
-            # Decide whether to call GPT
-            if heuristic_bot_confidence >= 90:
-                is_bot = True
-                final_confidence = heuristic_bot_confidence
-            else:
-                # Proceed to call GPT
-                sampled_posts = random.sample(user_posts, min(len(user_posts), 10)) if user_posts else []
-                gpt_response = self.query_gpt_analysis(sampled_posts, heuristic_bot_confidence)
-                gpt_is_bot_confidence = gpt_response["is_bot_true"]
-                gpt_not_bot_confidence = gpt_response["is_bot_false"]
+For each user, provide a JSON object with the following keys:
+- "user_id": the user's ID (as a string)
+- "classification": "Bot" or "Not Bot"
+- "confidence": a percentage between 0 and 100 (integer)
 
-                # Average the confidences
-                is_bot_true_avg = (heuristic_bot_confidence + gpt_is_bot_confidence) / 2
-                is_bot_false_avg = (heuristic_not_bot_confidence + gpt_not_bot_confidence) / 2
+Here are the users:
 
-                # Final decision
-                is_bot = is_bot_true_avg > is_bot_false_avg
-                final_confidence = max(is_bot_true_avg, is_bot_false_avg)
+"""
 
-            # Constrain final confidence
-            final_confidence = max(10, min(final_confidence, 100))  # Set minimum confidence to 10
+        for user in users:
+            user_id_str = str(user.get('id', 'N/A'))
+            username = user.get('username', 'N/A')
+            description = user.get('description', 'N/A')
+            location = user.get('location', 'N/A')
+            tweet_count = user.get('tweet_count', 'N/A')
+            z_score = user.get('z_score', 'N/A')
+            posts = user_posts.get(user_id_str, [])
+            posts = posts[:3]  # Limit number of posts per user
+            formatted_posts = "\n".join(f"- {post}" for post in posts)
 
-            return DetectionMark(
-                user_id=user['id'],
-                confidence=int(final_confidence),
-                bot=is_bot
-            )
-        except Exception as e:
-            #print(f"Error processing user {user.get('username', 'N/A')}: {e}")
-            return DetectionMark(user_id=user['id'], confidence=10, bot=False)
+            user_info = f"""
+User ID: {user_id_str}
+Username: {username}
+Description: {description}
+Location: {location}
+Tweet Count: {tweet_count}
+Z-Score: {z_score}
+Recent Posts:
+{formatted_posts}
 
-    def query_gpt_analysis(self, posts, heuristic_score):
-        try:
-            user_data = {
-                "heuristic_score": heuristic_score,
-                "posts": [{"text": post} for post in posts],
-            }
-            messages = [
+"""
+            prompt += user_info
+
+        prompt += """
+Please analyze the users and provide the classifications in the following JSON array (ensure it is valid JSON and nothing else):
+
+[
+  {
+    "user_id": "user_id_here",
+    "classification": "Bot",
+    "confidence": confidence_percentage
+  },
+  {
+    "user_id": "another_user_id",
+    "classification": "Not Bot",
+    "confidence": confidence_percentage
+  }
+  // ... one entry per user
+]
+
+Do not include any explanations or additional text. Only provide the JSON array.
+"""
+
+        # Call the OpenAI API
+        response = openai.ChatCompletion.create(
+            model='gpt-3.5-turbo',
+            messages=[
                 {
-                    "role": "system",
-                    "content": (
-                        "You are an AI assistant that detects bot-like behavior in social media accounts. "
-                        "Analyze the provided user data, which includes an initial heuristic suspicion score (between 0 and 100) and up to 10 recent posts. "
-                        "Determine the likelihood that the user is a bot or not. "
-                        "Provide two confidence scores between 0 and 100: 'is_bot_true' and 'is_bot_false'. "
-                        "These scores are independent and do not need to sum to 100. "
-                        "Respond **only** with a JSON object structured exactly as follows: "
-                        '{"is_bot_true": <confidence>, "is_bot_false": <confidence>}'
-
-                    )
+                    'role': 'system',
+                    'content': 'You are a helpful assistant for detecting bots on social media platforms.'
                 },
                 {
-                    "role": "user",
-                    "content": (
-                        "Here is the user data:\n\n"
-                        f"{json.dumps(user_data)}\n\n"
-                        "Please provide your classification and confidence as JSON."
-                    )
+                    'role': 'user',
+                    'content': prompt
                 }
-            ]
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=messages,
-                max_tokens=50,
-                temperature=0
-            )
-            analysis_text = response.choices[0].message["content"].strip()
-            #print(f"GPT response: {analysis_text}")
-            result = json.loads(analysis_text)
-            # After parsing result
-            is_bot_true = float(result.get("is_bot_true", 50))
-            is_bot_false = float(result.get("is_bot_false", 50))
-            # Ensure values are between 0 and 1
-            if not (0 <= is_bot_true <= 100 and 0 <= is_bot_false <= 100):
-                raise ValueError("Confidence scores out of expected range.")
-            return {"is_bot_true": is_bot_true, "is_bot_false": is_bot_false}
-        except Exception as e:
-            #print(f"Error parsing GPT response: {e}")
-            return {"is_bot_true": 50, "is_bot_false": 50}
+            ],
+            max_tokens=1500,  # Adjust based on expected response size
+            n=1,
+            stop=None,
+            temperature=0.3,
+        )
 
-            
+        return response['choices'][0]['message']['content']
+
+    # Function to parse ChatGPT's response
+    def parse_chatgpt_response(self, response_text):
+        # Extract JSON from the response
+        try:
+            # Use a regular expression to extract the JSON array
+            json_match = re.search(r'\[\s*{.*?}\s*\]', response_text, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON array found in the response.")
+
+            json_str = json_match.group(0)
+
+            # Clean up the JSON string to ensure it is valid
+            json_str = json_str.replace('// ... one entry per user', '')
+            json_str = re.sub(r'//.*?\n', '', json_str)  # Remove any comments
+            json_str = re.sub(r',\s*]', ']', json_str)   # Remove trailing commas before closing bracket
+
+            data = json.loads(json_str)
+            results = {}
+            for item in data:
+                user_id_str = str(item.get('user_id'))
+                classification = item.get('classification', '').lower()
+                confidence = item.get('confidence', 50)
+                # Ensure confidence is a number and within 0-100
+                try:
+                    confidence = float(confidence)
+                except ValueError:
+                    confidence = 50  # Default value if parsing fails
+                confidence = min(max(confidence, 0), 100)
+                is_bot = True if classification == 'bot' else False
+                results[user_id_str] = {
+                    'is_bot': is_bot,
+                    'confidence': confidence
+                }
+            return results
+        except (json.JSONDecodeError, ValueError, AttributeError) as e:
+            raise Exception(f"Error parsing ChatGPT response: {e}")
