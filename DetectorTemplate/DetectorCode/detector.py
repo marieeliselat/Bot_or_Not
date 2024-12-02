@@ -2,126 +2,112 @@ from abc_classes import ADetector
 from teams_classes import DetectionMark
 from collections import Counter
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from textblob import TextBlob
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 class Detector(ADetector):
     def detect_bot(self, session_data):
         accounts = []
-        # stop words = common words to ignore
-        stop_words = {"the", "and", "is", "in", "to", "of", "a", "for", "on", "at", "by", "with", "an", "this", "that", "it"}
+        # Define stop words as a list instead of a set
+        stop_words = ["the", "it", "by", "of", "that", "is", "with", "this", "for", "a", "to", "at", "and", "in", "on", "an"]
 
-        # print(session_data.users)
-        # print('/n')
+        # Initialize the vectorizer with stop words as a list
+        vectorizer = TfidfVectorizer(stop_words=stop_words)
 
-        # grab text from posts and split into words (ignoring stop words)
-        word_counter = Counter()
-        for post in session_data.posts:
-            words = re.findall(r'\b\w+\b', post['text'].lower())
-            filtered_words = [word for word in words if word not in stop_words]
-            word_counter.update(filtered_words)
+        emoji_pattern = re.compile("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]+", flags=re.UNICODE)
+        invalid_location_patterns = ["she/her", "he/him", "they/them", "planet", "moon", "universe"]
 
-        # find the most common word
-        most_common_word, _ = word_counter.most_common(1)[0] if word_counter else ("", 0)
+        # Machine Learning Model for Anomaly Detection
+        clf = IsolationForest(contamination=0.1)
 
-        # grab emojis
-        emoji_pattern = re.compile("[\U0001F600-\U0001F64F"  
-                                   "\U0001F300-\U0001F5FF"
-                                   "\U0001F680-\U0001F6FF"
-                                   "\U0001F1E0-\U0001F1FF"
-                                   "\U00002702-\U000027B0"
-                                   "\U000024C2-\U0001F251"
-                                   "]+", flags=re.UNICODE)
+        # Preprocessing tweets to get TF-IDF features for keyword density analysis
+        all_posts = [post['text'] for post in session_data.posts]
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words=stop_words)
+        tfidf_matrix = vectorizer.fit_transform(all_posts)
 
-        # invalid locations
-        invalid_location_patterns = [
-            "she/her", "he/him", "they/them", "pronouns", "blk", "rainbow", 
-            "planet", "mars", "moon", "space", "anywhere", "nowhere", 
-            "everywhere", "earth", "universe"
-        ]
-        
-        # iterate through the users dataset (list of dict)
         for user in session_data.users:
-            is_bot = False
-            confidence = 50  # default confidence
-
-            # Rule 1: Check if the username or description contains "bot"
-            if "bot" in user.get('username', '').lower() or "bot" in user.get('description', '').lower():
-                is_bot = True
-                confidence = max(confidence, 100)
-
-            # Rule 2: Check if the user uses the most common word in their posts
+            score = 50  # Starting confidence level, adjustable based on bot-like behavior
+            
+            # Text Analysis for Consistency, Keyword Density, and Sentiment
             user_posts = [post['text'] for post in session_data.posts if post['author_id'] == user['id']]
-            user_word_usage = any(most_common_word in post.lower() for post in user_posts)
-            if not user_word_usage:
-                is_bot = True
-                confidence = max(confidence, 100)
+            user_word_count = sum(len(post.split()) for post in user_posts)
+            avg_word_count = user_word_count / len(user_posts) if user_posts else 0
 
-            # Rule 3: Check if the location is suspicious or empty
-            location = user.get('location', '')  
-            if location:  # Check if location is not None
-                location = location.lower()  # Normalize case
-                
-                # Check if the location contains any invalid patterns
-                for pattern in invalid_location_patterns:
-                    if pattern in location:
-                        is_bot = True
-                        confidence = max(confidence, 100)
-                        break  # No need to check further patterns if one matches
-                
-                # Check for emojis in the location
-                if emoji_pattern.search(location):
-                    is_bot = True
-                    confidence = max(confidence, 100)
+            # Vocabulary Diversity (unique words per total words)
+            unique_words = set(word for post in user_posts for word in post.split())
+            vocab_diversity = len(unique_words) / user_word_count if user_word_count else 0
+            if vocab_diversity < 0.1:
+                score += 20
+            elif vocab_diversity < 0.3:
+                score += 10
+            else:
+                score -= 10  # Indicates human-like behavior
 
-            # Rule 4: Analyze tweet count
-            tweet_count = user.get('tweet_count', 0)
-            if 100 <= tweet_count <= 1000:
-                is_bot = True
-                confidence = max(confidence, 100)
-            # future = make it based on time that went by 
+            # Sentiment Consistency
+            sentiments = [TextBlob(post).sentiment.polarity for post in user_posts]
+            sentiment_variance = np.var(sentiments)
+            if sentiment_variance < 0.05:
+                score += 15
+            elif sentiment_variance > 0.2:
+                score -= 10  # Varied sentiment is more human-like
 
-            # Rule 5: Analyze z_score for abnormal values
-            z_score = user.get('z_score', 0)
-            if z_score < -2 or z_score > 2:
-                is_bot = True
-                confidence = max(confidence, 100)
+            # Keyword Density using TF-IDF
+            user_tfidf_vector = vectorizer.transform(user_posts)
+            avg_tfidf_score = user_tfidf_vector.mean()
+            if avg_tfidf_score > 0.5:
+                score += 20
+            else:
+                score -= 10  # Less repetitive keyword use suggests human behavior
 
-            # Rule 6: Check language usage of posts
-            user_languages = set(post['lang'] for post in session_data.posts if post['author_id'] == user['id'])
-            if len(user_languages) > 2:
-                is_bot = True
-                confidence = max(confidence, 100)
-            for lang in user_languages:
-                if emoji_pattern.search(lang):
-                    is_bot = True
-                    confidence = max(confidence, 100)
+            # Emoji Analysis
+            emoji_count = sum(len(emoji_pattern.findall(post)) for post in user_posts)
+            avg_emoji_usage = emoji_count / len(user_posts) if user_posts else 0
+            if avg_emoji_usage > 3:
+                score += 10
+            elif avg_emoji_usage < 1:
+                score -= 5  # Limited emoji use is more human-like
 
-
-            # Rule 7: Posting times (e.g., very frequent, non-human intervals)
-            posting_times = [post['created_at'] for post in session_data.posts if post['author_id'] == user['id']]
+            # Temporal Posting Pattern Analysis
+            posting_times = [datetime.strptime(post['created_at'], "%Y-%m-%dT%H:%M:%S.000Z") for post in session_data.posts if post['author_id'] == user['id']]
             if len(posting_times) > 1:
-                # check the time difference between consecutive posts
-                time_differences = [
-                    (datetime.strptime(posting_times[i], "%Y-%m-%dT%H:%M:%S.000Z") - datetime.strptime(posting_times[i-1], "%Y-%m-%dT%H:%M:%S.000Z")).total_seconds()
-                    for i in range(1, len(posting_times))
-                ]
-                # if posts are too close together, flag as suspicious
-                if any(diff < 10 for diff in time_differences):  # less than 10 seconds between posts
-                    is_bot = True
-                    confidence = max(confidence, 95)
+                intervals = np.diff(sorted(posting_times)).astype('timedelta64[s]').astype(int)
+                avg_interval = np.mean(intervals) if intervals.size > 0 else 0
+                if avg_interval < 300:
+                    score += 20
+                if any(interval < 10 for interval in intervals):
+                    score += 25
+                else:
+                    score -= 15  # Longer intervals imply non-bot behavior
 
-            # Final classification
+            # Location Validity Check
+            location = user.get('location', '').lower() if user.get('location') else ''
+            if any(loc in location for loc in invalid_location_patterns) or emoji_pattern.search(location):
+                score += 10
+            else:
+                score -= 10  # Valid location is more human-like
+
+            # Abnormal Account Behavior with Isolation Forest
+            tweet_count = user.get('tweet_count', 0)
+            following = user.get('following_count', 0)
+            followers = user.get('followers_count', 0)
+            data_point = np.array([[tweet_count, following, followers]])
+            outlier = clf.fit_predict(data_point)  # -1 indicates outlier
+            if outlier[0] == -1:
+                score += 30
+            else:
+                score -= 10  # Typical user behavior
+
+            # Normalize score to be between 1 and 100
+            final_confidence = max(1, min(score, 100))
+
             detection = DetectionMark(
                 user_id=user['id'],
-                confidence=confidence if is_bot else 1,
-                bot=is_bot
+                confidence=final_confidence,
+                bot=final_confidence > 60  # Threshold for bot detection
             )
             accounts.append(detection)
-
-        # print("\nDetected Users and Their Bot Status:")
-        # for detection in accounts:
-        #     print(f"user_id='{detection.user_id}', confidence={detection.confidence}, bot={detection.bot}")
-            
 
         return accounts
