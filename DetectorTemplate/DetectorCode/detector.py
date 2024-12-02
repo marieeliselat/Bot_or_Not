@@ -12,7 +12,6 @@ import json
 # Set your OpenAI API key
 openai.api_key = 'sk-svcacct-hLryFGI6k7id2c8JNbQfOIBQku4N4FaI4ZNudgEHicS4kO5HhTcm5HKt3cPxi4RWKggfT3BlbkFJse802MFwaCvHoH_nSgEZPX-f2sQIfNh6e71_LtPsxnN5uE8milyoxoJBpVBrpioInWwA'  # Replace with your actual API key
 
-# Define the Detector class
 class Detector(ADetector):
     def detect_bot(self, session_data):
         accounts = []
@@ -29,51 +28,33 @@ class Detector(ADetector):
                 user_posts[user_id_str] = []
             user_posts[user_id_str].append(post['text'])
 
-        # Define the emoji pattern
-        emoji_pattern = re.compile(
-            "[\U0001F600-\U0001F64F"  # Emoticons
-            "\U0001F300-\U0001F5FF"  # Symbols & Pictographs
-            "\U0001F680-\U0001F6FF"  # Transport & Map Symbols
-            "\U0001F1E0-\U0001F1FF"  # Flags
-            "\U00002702-\U000027B0"
-            "\U000024C2-\U0001F251"
-            "]+", flags=re.UNICODE
-        )
-
-        # First pass: Heuristic analysis
+        # Step 1: Heuristic analysis
+        heuristic_results = {}
         for user in session_data.users:
             user_id_str = str(user['id'])
             if user_id_str in user_ids_processed:
-                continue  # Skip if already processed
+                continue
 
             is_bot = False
-            confidence = 50  # Start with a neutral confidence
+            confidence = 50
 
-            # # Rule 1: Check if the username or description contains "bot"
-            # if "bot" in user.get('username', '').lower() or "bot" in user.get('description', '').lower():
-            #     confidence += 20  # Increase confidence moderately
-
-            # Rule 2: Check if the user has repetitive tweets with similar content
+            # Rule 2: Check repetitive tweets
             posts = user_posts.get(user_id_str, [])
-            if len(posts) > 1:  # Ensure there are at least two posts to compare
-                similarity_threshold = 0.8  # Threshold for similarity (can be adjusted)
+            if len(posts) > 1:
+                similarity_threshold = 0.8
                 similar_pairs_count = 0
                 total_pairs = 0
-
-                # Compare each tweet with every other tweet
                 for i in range(len(posts)):
                     for j in range(i + 1, len(posts)):
                         total_pairs += 1
                         similarity_ratio = SequenceMatcher(None, posts[i], posts[j]).ratio()
                         if similarity_ratio > similarity_threshold:
                             similar_pairs_count += 1
-
-                # If the majority of the tweets are similar, classify as a bot
-                if total_pairs > 0 and (similar_pairs_count / total_pairs) > 0.5:  # More than 50% of pairs are similar
+                if total_pairs > 0 and (similar_pairs_count / total_pairs) > 0.5:
                     is_bot = True
                     confidence = max(confidence, 100)
 
-            # Rule 3: Check if the location is suspicious or empty
+            # Rule 3: Check location
             location = user.get('location', '')
             if location:
                 location = location.lower()
@@ -82,40 +63,31 @@ class Detector(ADetector):
                     "planet", "mars", "moon", "space", "anywhere", "nowhere",
                     "everywhere", "earth", "universe"
                 ]
-                for pattern in invalid_location_patterns:
-                    if pattern in location:
-                        confidence += 10  # Slight bot indicator
-                        break
-                if emoji_pattern.search(location):
-                    confidence += 10  # Slight bot indicator
+                if any(pattern in location for pattern in invalid_location_patterns):
+                    confidence += 10
             else:
-                # Empty location might be slightly suspicious
                 confidence += 5
 
-            # Rule 4: Analyze tweet count
+            # Rule 4: Tweet count
             tweet_count = user.get('tweet_count', 0)
             if 100 <= tweet_count <= 1000:
-                confidence += 5  # Slight bot indicator
+                confidence += 5
 
-            # Rule 5: Analyze z_score for abnormal values
+            # Rule 5: Z-Score
             z_score = user.get('z_score', 0)
             if z_score < -2 or z_score > 2:
-                confidence += 10  # Moderate bot indicator
+                confidence += 10
 
-            # Rule 6: Check language usage of posts
+            # Rule 6: Language diversity
             user_languages = set(post['lang'] for post in session_data.posts if str(post['author_id']) == user_id_str)
             if len(user_languages) > 2:
-                confidence += 10  # Moderate bot indicator
-            for lang in user_languages:
-                if emoji_pattern.search(lang):
-                    confidence += 10  # Moderate bot indicator
+                confidence += 10
 
-            # Rule 7: Posting times (e.g., very frequent, non-human intervals)
+            # Rule 7: Posting frequency
             posting_times = [
                 post['created_at'] for post in session_data.posts if str(post['author_id']) == user_id_str
             ]
             if len(posting_times) > 1:
-                # Check the time difference between consecutive posts
                 time_differences = [
                     (
                         datetime.strptime(posting_times[i], "%Y-%m-%dT%H:%M:%S.000Z") -
@@ -123,33 +95,45 @@ class Detector(ADetector):
                     ).total_seconds()
                     for i in range(1, len(posting_times))
                 ]
-                # If posts are too close together, flag as suspicious
-                if any(diff < 10 for diff in time_differences):  # Less than 10 seconds between posts
-                    confidence += 10  # Moderate bot indicator
+                if any(diff < 10 for diff in time_differences):
+                    confidence += 10
 
-            # Ensure confidence is within 0-100%
             confidence = max(0, min(confidence, 100))
+            is_bot = confidence >= 70
 
-            # Determine if the user is a bot based on confidence
-            is_bot = confidence >= 70  # You can adjust this threshold as needed
-
-            # Final classification for high confidence users
-            detection = DetectionMark(
-                user_id=user_id_str,  # User ID as string
-                confidence=confidence,
-                bot=is_bot
-            )
-            accounts.append(detection)
+            heuristic_results[user_id_str] = {'is_bot': is_bot, 'confidence': confidence}
             user_ids_processed.add(user_id_str)
 
-        # Print the results for the first few users only
-        for detection in accounts[:5]:
-            user = user_id_to_user.get(detection.user_id, {})
-            print(f"User ID: {detection.user_id}")
-            print(f"Username: {user.get('username', 'N/A')}")
-            print(f"Confidence: {detection.confidence}%")
-            print(f"Classified as bot: {detection.bot}")
-            print("-" * 30)
+        # Step 2: Analyze users with ChatGPT
+        chatgpt_analysis = self.analyze_users_with_chatgpt(session_data.users, user_posts)
+        chatgpt_results = self.parse_chatgpt_response(chatgpt_analysis)
+
+        # Step 3: Combine Heuristics and ChatGPT results
+        for user_id, chatgpt_result in chatgpt_results.items():
+            chatgpt_is_bot = chatgpt_result['is_bot']
+            chatgpt_confidence = chatgpt_result['confidence']
+
+            heuristic_result = heuristic_results.get(user_id, {'is_bot': False, 'confidence': 50})
+            heuristic_is_bot = heuristic_result['is_bot']
+            heuristic_confidence = heuristic_result['confidence']
+
+            if chatgpt_is_bot == heuristic_is_bot:
+                final_confidence = (chatgpt_confidence + heuristic_confidence) / 2
+                final_is_bot = chatgpt_is_bot
+            else:
+                if chatgpt_confidence > heuristic_confidence:
+                    final_is_bot = chatgpt_is_bot
+                    final_confidence = chatgpt_confidence
+                else:
+                    final_is_bot = heuristic_is_bot
+                    final_confidence = heuristic_confidence
+
+            detection = DetectionMark(
+                user_id=user_id,
+                confidence=final_confidence,
+                bot=final_is_bot
+            )
+            accounts.append(detection)
 
         return accounts
 
